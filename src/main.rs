@@ -9,15 +9,19 @@ const DEFAULT_MANUAL_FAN_SPEED: u8 = 5;
 
 fn main() {
     let manual_fan_speed = std::env::var("MANUAL_FAN_SPEED").ok()
-        .and_then(|value| value.parse::<u8>().ok())
+        .map(|value| value.parse::<u8>().expect("couldn't parse MANUAL_FAN_SPEED"))
         .unwrap_or(DEFAULT_MANUAL_FAN_SPEED);
 
+    if manual_fan_speed > 100 {
+        panic!("MANUAL_FAN_SPEED must be between 0 and 100");
+    }
+
     let max_temperature = std::env::var("MAX_TEMPERATURE").ok()
-        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.parse::<u32>().expect("couldn't parse MAX_TEMPERATURE"))
         .unwrap_or(DEFAULT_MAX_TEMPERATURE);
 
     let delay = std::env::var("DELAY").ok()
-        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.parse::<u64>().expect("couldn't parse DELAY"))
         .map(|delay| Duration::from_secs(delay))
         .unwrap_or(DEFAULT_DELAY);
 
@@ -37,14 +41,20 @@ fn main() {
                 } else {
                     if !is_manual_fan_control {
                         enable_manual_fan_control();
+                        is_manual_fan_control = true;
                     }
-                    set_manual_fan_speed(manual_fan_speed);
+                    match set_manual_fan_speed(manual_fan_speed) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            eprintln!("Error setting manual fan speed: {}", error);
+                            disable_manual_fan_control();
+                            exit(1);
+                        }
+                    }
                 }
             }
             Err(error) => {
-                eprintln!("{error:?}");
-                // Try to disable manual fan control.
-                // We might not necessarily have encountered an error with ipmitool.
+                eprintln!("Error getting temperature: {error:?}");
                 disable_manual_fan_control();
                 exit(1);
             }
@@ -65,20 +75,19 @@ fn disable_manual_fan_control() {
         .expect("couldn't disable manual fan control");
 }
 
-fn set_manual_fan_speed(percentage: u8) {
-    if percentage >= 100 {
-        panic!("percentage must be between 0 and 100");
+fn set_manual_fan_speed(percentage: u8) -> Result<(), String> {
+    if percentage > 100 {
+        panic!("fan speed must be between 0 and 100");
     }
     println!("Setting manual fan speed to {}%", percentage);
     raw_ipmitool(format!("0x30 0x30 0x02 0xff {:#04x}", percentage))
-        .expect("couldn't set manual fan speed");
 }
 
 fn raw_ipmitool(arguments: impl Into<String>) -> Result<(), String> {
     let output = Command::new("ipmitool")
         .arg("-I").arg("open")
         .arg("raw")
-        .arg(arguments.into())
+        .args(arguments.into().split(" "))
         .output()
         .expect("couldn't invoke ipmitool");
     if output.status.success() {
@@ -98,16 +107,20 @@ fn get_max_temperature() -> Result<u32, String> {
 
 fn get_temperatures() -> Result<HashMap<String, u32>, String> {
     let output = Command::new("ipmitool")
-        .arg("-i").arg("open")
+        .arg("-I").arg("open")
         .args(&["sdr", "type", "temperature"])
         .output()
         .expect("couldn't invoke ipmitool");
     if output.status.success() {
-        let output = String::from_utf8(output.stdout).unwrap();
+        let output = String::from_utf8(output.stdout)
+            .map_err(|e| format!("couldn't parse ipmitool output: {}", e))?;
         let mut temperatures = HashMap::new();
         for line in output.lines() {
             let parts = line.split("|")
                 .collect::<Vec<_>>();
+            if parts.len() != 5 {
+                continue;
+            }
             let name = parts[0].trim();
             let temperature = parts[4].trim();
             if temperature == "No Reading" {
