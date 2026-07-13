@@ -1,0 +1,22 @@
+[Unit]
+Description=iDRAC Fan Controller
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/idrac-fan-controller
+
+Environment="MAX_TEMPERATURE=50"
+Environment="MANUAL_FAN_SPEED=5"
+Environment="DELAY=10"
+
+Restart=always
+RestartSec=10
+
+# Automatically disable manual fan control if the script stops.
+# That way, we never end up in a situation where the script isn't running but manual fan control
+# is still enabled (as long as we can still reach iDRAC).
+ExecStopPost=-/usr/bin/ipmitool -I open raw 0x30 0x30 0x01 0x01
+
+[Install]
+WantedBy=multi-user.target
