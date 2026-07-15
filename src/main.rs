@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::process::{exit, Command};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -8,88 +8,99 @@ const DEFAULT_MAX_TEMPERATURE: u32 = 50;
 const DEFAULT_MANUAL_FAN_SPEED: u8 = 5;
 
 fn main() {
-    let manual_fan_speed = std::env::var("MANUAL_FAN_SPEED").ok()
-        .map(|value| value.parse::<u8>().expect("couldn't parse MANUAL_FAN_SPEED"))
+    let manual_fan_speed = std::env::var("MANUAL_FAN_SPEED")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u8>()
+                .expect("couldn't parse MANUAL_FAN_SPEED")
+        })
         .unwrap_or(DEFAULT_MANUAL_FAN_SPEED);
 
     if manual_fan_speed > 100 {
         panic!("MANUAL_FAN_SPEED must be between 0 and 100");
     }
 
-    let max_temperature = std::env::var("MAX_TEMPERATURE").ok()
-        .map(|value| value.parse::<u32>().expect("couldn't parse MAX_TEMPERATURE"))
+    let max_temperature = std::env::var("MAX_TEMPERATURE")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .expect("couldn't parse MAX_TEMPERATURE")
+        })
         .unwrap_or(DEFAULT_MAX_TEMPERATURE);
 
-    let delay = std::env::var("DELAY").ok()
+    let delay = std::env::var("DELAY")
+        .ok()
         .map(|value| value.parse::<u64>().expect("couldn't parse DELAY"))
         .map(|delay| Duration::from_secs(delay))
         .unwrap_or(DEFAULT_DELAY);
 
-    // Whether we have already enabled manual fan control.
-    let mut is_manual_fan_control = false;
+    let mut idrac = Idrac::new();
 
     loop {
-        let temperature = get_max_temperature();
-        match temperature {
-            Ok(temperature) => {
-                println!("Max temperature: {}", temperature);
-                if temperature > max_temperature {
-                    if is_manual_fan_control {
-                        disable_manual_fan_control();
-                        is_manual_fan_control = false;
-                    }
-                } else {
-                    if !is_manual_fan_control {
-                        enable_manual_fan_control();
-                        is_manual_fan_control = true;
-                    }
-                    match set_manual_fan_speed(manual_fan_speed) {
-                        Ok(_) => {}
-                        Err(error) => {
-                            eprintln!("Error setting manual fan speed: {}", error);
-                            disable_manual_fan_control();
-                            exit(1);
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!("Error getting temperature: {error:?}");
-                disable_manual_fan_control();
-                exit(1);
-            }
+        let temperature = get_max_temperature().expect("couldn't get maximum temperature");
+        if temperature > max_temperature {
+            println!("Temperature: {}", temperature);
+            idrac.disable_manual_fan_control();
+        } else {
+            idrac.set_manual_fan_speed(manual_fan_speed);
         }
         thread::sleep(delay);
     }
 }
 
-fn enable_manual_fan_control() {
-    println!("Enabling manual fan control");
-    raw_ipmitool("0x30 0x30 0x01 0x00")
-        .expect("couldn't enable manual fan control");
+struct Idrac {
+    /// The current fan speed, if enabled.
+    /// `None` if manual fan control is disabled.
+    fan_speed: Option<u8>,
 }
 
-fn disable_manual_fan_control() {
-    println!("Disabling manual fan control");
-    raw_ipmitool("0x30 0x30 0x01 0x01")
-        .expect("couldn't disable manual fan control");
-}
-
-fn set_manual_fan_speed(percentage: u8) -> Result<(), String> {
-    if percentage > 100 {
-        panic!("fan speed must be between 0 and 100");
+impl Idrac {
+    pub fn new() -> Idrac {
+        Idrac { fan_speed: None }
     }
-    println!("Setting manual fan speed to {}%", percentage);
-    raw_ipmitool(format!("0x30 0x30 0x02 0xff {:#04x}", percentage))
+
+    fn enable_manual_fan_control() -> Result<(), String> {
+        println!("Enabling manual fan control");
+        raw_ipmitool("0x30 0x30 0x01 0x00")
+            .map_err(|msg| format!("couldn't enable manual fan control: {msg}"))
+    }
+
+    pub fn disable_manual_fan_control(&mut self) -> Result<(), String> {
+        println!("Disabling manual fan control");
+        raw_ipmitool("0x30 0x30 0x01 0x01")
+            .map_err(|msg | format!("couldn't disable manual fan control: {msg}"))?;
+        self.fan_speed = None;
+        Ok(())
+    }
+
+    pub fn set_manual_fan_speed(&mut self, percentage: u8) -> Result<(), String> {
+        if percentage > 100 {
+            return Err("percentage must be between 0 and 100".to_owned());
+        }
+        if self.fan_speed == Some(percentage) {
+            return Ok(());
+        }
+        if self.fan_speed.is_none() {
+            Idrac::enable_manual_fan_control()?;
+        }
+        println!("Setting manual fan speed to {}%", percentage);
+        raw_ipmitool(format!("0x30 0x30 0x02 0xff {:#04x}", percentage))
+            .map_err(|msg| format!("couldn't set manual fan speed: {msg}"))?;
+        self.fan_speed = Some(percentage);
+        Ok(())
+    }
 }
 
 fn raw_ipmitool(arguments: impl Into<String>) -> Result<(), String> {
     let output = Command::new("ipmitool")
-        .arg("-I").arg("open")
+        .arg("-I")
+        .arg("open")
         .arg("raw")
         .args(arguments.into().split(" "))
         .output()
-        .expect("couldn't invoke ipmitool");
+        .map_err(|msg| format!("couldn't invoke ipmitool: {msg}"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -100,24 +111,25 @@ fn raw_ipmitool(arguments: impl Into<String>) -> Result<(), String> {
 
 fn get_max_temperature() -> Result<u32, String> {
     let temperatures = get_temperatures()?;
-    temperatures.into_values()
+    temperatures
+        .into_values()
         .max()
-        .ok_or_else(|| "couldn't find any temperature".to_owned())
+        .ok_or_else(|| "couldn't find temperature".to_owned())
 }
 
 fn get_temperatures() -> Result<HashMap<String, u32>, String> {
     let output = Command::new("ipmitool")
-        .arg("-I").arg("open")
+        .arg("-I")
+        .arg("open")
         .args(&["sdr", "type", "temperature"])
         .output()
-        .expect("couldn't invoke ipmitool");
+        .map_err(|msg| format!("couldn't invoke ipmitool: {msg}"))?;
     if output.status.success() {
         let output = String::from_utf8(output.stdout)
             .map_err(|e| format!("couldn't parse ipmitool output: {}", e))?;
         let mut temperatures = HashMap::new();
         for line in output.lines() {
-            let parts = line.split("|")
-                .collect::<Vec<_>>();
+            let parts = line.split("|").collect::<Vec<_>>();
             if parts.len() != 5 {
                 continue;
             }
@@ -126,7 +138,8 @@ fn get_temperatures() -> Result<HashMap<String, u32>, String> {
             if temperature == "No Reading" {
                 continue;
             }
-            let temperature = temperature.split(" ")
+            let temperature = temperature
+                .split(" ")
                 .next()
                 .and_then(|value| value.parse::<u32>().ok());
             if let Some(temperature) = temperature {
