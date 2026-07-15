@@ -4,10 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/idrac-fan-controller
+ExecStart=/usr/local/bin/idrac-fan-controller "50:10" "60:20"
 
-Environment="MAX_TEMPERATURE=50"
-Environment="MANUAL_FAN_SPEED=5"
 Environment="DELAY=10"
 
 Restart=always

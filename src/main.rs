@@ -1,50 +1,121 @@
 use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::process::Command;
-use std::thread;
 use std::time::Duration;
+use std::{fmt, thread};
 
 const DEFAULT_DELAY: Duration = Duration::from_secs(10);
-const DEFAULT_MAX_TEMPERATURE: u32 = 50;
-const DEFAULT_MANUAL_FAN_SPEED: u8 = 5;
 
-fn main() {
-    let manual_fan_speed = std::env::var("MANUAL_FAN_SPEED")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u8>()
-                .expect("couldn't parse MANUAL_FAN_SPEED")
-        })
-        .unwrap_or(DEFAULT_MANUAL_FAN_SPEED);
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+struct Temperature(u32);
 
-    if manual_fan_speed > 100 {
-        panic!("MANUAL_FAN_SPEED must be between 0 and 100");
+impl fmt::Display for Temperature {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}˚C", self.0)
+    }
+}
+
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, PartialEq, Eq)]
+struct FanSpeed(u8);
+
+impl FanSpeed {
+    pub fn new(percentage: u8) -> FanSpeed {
+        if percentage > 100 {
+            panic!("percentage must be between 0 and 100");
+        }
+        FanSpeed(percentage)
+    }
+}
+
+impl fmt::LowerHex for FanSpeed {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for FanSpeed {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}%", self.0)
+    }
+}
+
+#[derive(Debug)]
+struct FanConfig {
+    config: Vec<(Temperature, FanSpeed)>,
+}
+
+impl FanConfig {
+    pub fn new(config: impl Into<Vec<(Temperature, FanSpeed)>>) -> FanConfig {
+        let mut config = config.into();
+        config.sort_by_key(|&(max_temp, _)| max_temp);
+        FanConfig { config }
     }
 
-    let max_temperature = std::env::var("MAX_TEMPERATURE")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u32>()
-                .expect("couldn't parse MAX_TEMPERATURE")
-        })
-        .unwrap_or(DEFAULT_MAX_TEMPERATURE);
+    pub fn from_iter(iter: impl IntoIterator<Item = String>) -> FanConfig {
+        let config = iter
+            .into_iter()
+            .map(|value| {
+                let parts = value.split(":").collect::<Vec<_>>();
+                assert_eq!(parts.len(), 2);
+                let max_temp = parts[0]
+                    .parse::<u32>()
+                    .expect("couldn't parse max temperature");
+                let fan_speed = parts[1].parse::<u8>().expect("couldn't parse fan speed");
+                (Temperature(max_temp), FanSpeed::new(fan_speed))
+            })
+            .collect::<Vec<_>>();
+        FanConfig::new(config)
+    }
 
+    /// The configured fan speed for the current temperature.
+    /// Returns `None` if manual fan control should be disabled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use idrac-fan-controller::FanConfig;
+    ///
+    /// let config = FanConfig::new(&[
+    ///     (Temperature(50), FanSpeed::new(10)),
+    ///     (Temperature(60), FanSpeed::new(20))
+    /// ]);
+    ///
+    /// assert_eq!(config.fan_speed(Temperature(45)), Some(FanSpeed::new(10)));
+    /// assert_eq!(config.fan_speed(Temperature(55)), Some(FanSpeed::new(20)));
+    /// assert_eq!(config.fan_speed(Temperature(65)), None));
+    /// ```
+    pub fn fan_speed(&self, temperature: Temperature) -> Option<FanSpeed> {
+        for &(max_temp, fan_speed) in &self.config {
+            if temperature < max_temp {
+                return Some(fan_speed);
+            }
+        }
+        None
+    }
+}
+
+fn main() {
     let delay = std::env::var("DELAY")
         .ok()
         .map(|value| value.parse::<u64>().expect("couldn't parse DELAY"))
         .map(|delay| Duration::from_secs(delay))
         .unwrap_or(DEFAULT_DELAY);
 
+    let config = FanConfig::from_iter(std::env::args().skip(1));
+
     let mut idrac = Idrac::new();
 
     loop {
         let temperature = get_max_temperature().unwrap();
-        if temperature > max_temperature {
-            println!("Temperature: {}", temperature);
-            idrac.disable_manual_fan_control().unwrap();
-        } else {
-            idrac.set_manual_fan_speed(manual_fan_speed).unwrap();
+        let fan_speed = config.fan_speed(Temperature(temperature));
+        match fan_speed {
+            None => {
+                println!("Temperature: {}", temperature);
+                idrac.disable_manual_fan_control().unwrap();
+            }
+            Some(fan_speed) => {
+                idrac.set_manual_fan_speed(fan_speed).unwrap();
+            }
         }
         thread::sleep(delay);
     }
@@ -53,7 +124,7 @@ fn main() {
 struct Idrac {
     /// The current fan speed, if enabled.
     /// `None` if manual fan control is disabled.
-    fan_speed: Option<u8>,
+    fan_speed: Option<FanSpeed>,
 }
 
 impl Idrac {
@@ -70,22 +141,19 @@ impl Idrac {
     pub fn disable_manual_fan_control(&mut self) -> Result<(), String> {
         println!("Disabling manual fan control");
         raw_ipmitool("0x30 0x30 0x01 0x01")
-            .map_err(|msg | format!("couldn't disable manual fan control: {msg}"))?;
+            .map_err(|msg| format!("couldn't disable manual fan control: {msg}"))?;
         self.fan_speed = None;
         Ok(())
     }
 
-    pub fn set_manual_fan_speed(&mut self, percentage: u8) -> Result<(), String> {
-        if percentage > 100 {
-            return Err("percentage must be between 0 and 100".to_owned());
-        }
+    pub fn set_manual_fan_speed(&mut self, percentage: FanSpeed) -> Result<(), String> {
         if self.fan_speed == Some(percentage) {
             return Ok(());
         }
         if self.fan_speed.is_none() {
             Idrac::enable_manual_fan_control()?;
         }
-        println!("Setting manual fan speed to {}%", percentage);
+        println!("Setting manual fan speed to {}", percentage);
         raw_ipmitool(format!("0x30 0x30 0x02 0xff {:#04x}", percentage))
             .map_err(|msg| format!("couldn't set manual fan speed: {msg}"))?;
         self.fan_speed = Some(percentage);
@@ -156,5 +224,75 @@ fn get_temperatures() -> Result<HashMap<String, u32>, String> {
     } else {
         let message = String::from_utf8_lossy(&output.stderr);
         Err(message.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fan_config_from_empty_iter() {
+        let config = FanConfig::from_iter(Vec::<String>::new());
+        assert_eq!(Vec::<(Temperature, FanSpeed)>::new(), config.config)
+    }
+
+    #[test]
+    fn test_fan_config_from_iter() {
+        let config = FanConfig::from_iter(["50:10".to_owned(), "60:20".to_owned()]);
+        assert_eq!(vec![
+            (Temperature(50), FanSpeed::new(10)),
+            (Temperature(60), FanSpeed::new(20))
+        ], config.config)
+    }
+
+    #[test]
+    fn test_fan_config_from_unsorted_iter() {
+        let config = FanConfig::from_iter(["60:20".to_owned(), "50:10".to_owned()]);
+        assert_eq!(vec![
+            (Temperature(50), FanSpeed::new(10)),
+            (Temperature(60), FanSpeed::new(20))
+        ], config.config)
+    }
+
+    #[test]
+    fn test_empty_fan_config() {
+        let config = FanConfig::new(&[]);
+        assert_eq!(config.fan_speed(Temperature(0)), None);
+        assert_eq!(config.fan_speed(Temperature(100)), None);
+    }
+
+    #[test]
+    fn test_simple_fan_config() {
+        let config = FanConfig::new(&[(Temperature(50), FanSpeed::new(10))]);
+        assert_eq!(config.fan_speed(Temperature(45)), Some(FanSpeed::new(10)));
+        assert_eq!(config.fan_speed(Temperature(50)), None);
+        assert_eq!(config.fan_speed(Temperature(55)), None);
+    }
+
+    #[test]
+    fn test_fan_config() {
+        let config = FanConfig::new(&[
+            (Temperature(50), FanSpeed::new(10)),
+            (Temperature(60), FanSpeed::new(20)),
+        ]);
+        assert_eq!(config.fan_speed(Temperature(45)), Some(FanSpeed::new(10)));
+        assert_eq!(config.fan_speed(Temperature(50)), Some(FanSpeed::new(20)));
+        assert_eq!(config.fan_speed(Temperature(55)), Some(FanSpeed::new(20)));
+        assert_eq!(config.fan_speed(Temperature(60)), None);
+        assert_eq!(config.fan_speed(Temperature(65)), None);
+    }
+
+    #[test]
+    fn test_unsorted_fan_config() {
+        let config = FanConfig::new(&[
+            (Temperature(60), FanSpeed::new(20)),
+            (Temperature(50), FanSpeed::new(10)),
+        ]);
+        assert_eq!(config.fan_speed(Temperature(45)), Some(FanSpeed::new(10)));
+        assert_eq!(config.fan_speed(Temperature(50)), Some(FanSpeed::new(20)));
+        assert_eq!(config.fan_speed(Temperature(55)), Some(FanSpeed::new(20)));
+        assert_eq!(config.fan_speed(Temperature(60)), None);
+        assert_eq!(config.fan_speed(Temperature(65)), None);
     }
 }
