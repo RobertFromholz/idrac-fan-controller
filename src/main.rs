@@ -106,15 +106,26 @@ fn main() {
     let mut idrac = Idrac::new();
 
     loop {
-        let temperature = get_max_temperature().unwrap();
-        let fan_speed = config.fan_speed(Temperature(temperature));
-        match fan_speed {
-            None => {
-                println!("Temperature: {}", temperature);
-                idrac.disable_manual_fan_control().unwrap();
+        match get_max_temperature() {
+            Ok(temperature) => {
+                let fan_speed = config.fan_speed(Temperature(temperature));
+                match fan_speed {
+                    None => {
+                        println!("Temperature: {}", temperature);
+                        if let Err(msg) = idrac.disable_manual_fan_control() {
+                            eprintln!("Error: {}", msg);
+                        }
+                    }
+                    Some(fan_speed) => {
+                        if let Err(msg) = idrac.set_manual_fan_speed(fan_speed) {
+                            eprintln!("Error: {}", msg);
+                        }
+                    }
+                }
             }
-            Some(fan_speed) => {
-                idrac.set_manual_fan_speed(fan_speed).unwrap();
+            Err(msg) => {
+                eprintln!("Error: {}", msg);
+                let _ = idrac.disable_manual_fan_control();
             }
         }
         thread::sleep(delay);
