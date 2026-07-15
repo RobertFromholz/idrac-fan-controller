@@ -39,12 +39,12 @@ fn main() {
     let mut idrac = Idrac::new();
 
     loop {
-        let temperature = get_max_temperature().expect("couldn't get maximum temperature");
+        let temperature = get_max_temperature().unwrap();
         if temperature > max_temperature {
             println!("Temperature: {}", temperature);
-            idrac.disable_manual_fan_control();
+            idrac.disable_manual_fan_control().unwrap();
         } else {
-            idrac.set_manual_fan_speed(manual_fan_speed);
+            idrac.set_manual_fan_speed(manual_fan_speed).unwrap();
         }
         thread::sleep(delay);
     }
@@ -90,6 +90,12 @@ impl Idrac {
             .map_err(|msg| format!("couldn't set manual fan speed: {msg}"))?;
         self.fan_speed = Some(percentage);
         Ok(())
+    }
+}
+
+impl Drop for Idrac {
+    fn drop(&mut self) {
+        let _ = self.disable_manual_fan_control();
     }
 }
 
