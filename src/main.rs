@@ -111,12 +111,17 @@ fn main() {
                 let fan_speed = config.fan_speed(Temperature(temperature));
                 match fan_speed {
                     None => {
-                        println!("Temperature: {}", temperature);
+                        if idrac.fan_speed != None {
+                            println!("Temperature: {}", temperature);
+                        }
                         if let Err(msg) = idrac.disable_manual_fan_control() {
                             eprintln!("Error: {}", msg);
                         }
                     }
                     Some(fan_speed) => {
+                        if Some(fan_speed) != idrac.fan_speed {
+                            println!("Temperature: {}", temperature);
+                        }
                         if let Err(msg) = idrac.set_manual_fan_speed(fan_speed) {
                             eprintln!("Error: {}", msg);
                         }
