@@ -40,18 +40,18 @@ impl fmt::Display for FanSpeed {
 }
 
 #[derive(Debug)]
-struct FanConfig {
+struct FanCurve {
     config: Vec<(Temperature, FanSpeed)>,
 }
 
-impl FanConfig {
-    pub fn new(config: impl Into<Vec<(Temperature, FanSpeed)>>) -> FanConfig {
+impl FanCurve {
+    pub fn new(config: impl Into<Vec<(Temperature, FanSpeed)>>) -> FanCurve {
         let mut config = config.into();
         config.sort_by_key(|&(max_temp, _)| max_temp);
-        FanConfig { config }
+        FanCurve { config }
     }
 
-    pub fn from_iter(iter: impl IntoIterator<Item = String>) -> FanConfig {
+    pub fn from_iter(iter: impl IntoIterator<Item = String>) -> FanCurve {
         let config = iter
             .into_iter()
             .map(|value| {
@@ -64,7 +64,7 @@ impl FanConfig {
                 (Temperature(max_temp), FanSpeed::new(fan_speed))
             })
             .collect::<Vec<_>>();
-        FanConfig::new(config)
+        FanCurve::new(config)
     }
 
     /// The configured fan speed for the current temperature.
@@ -95,17 +95,23 @@ impl FanConfig {
 }
 
 fn main() {
+    // Load environment variables and the 'fan-curve'.
     let delay = std::env::var("DELAY")
         .ok()
         .map(|value| value.parse::<u64>().expect("couldn't parse DELAY"))
         .map(|delay| Duration::from_secs(delay))
         .unwrap_or(DEFAULT_DELAY);
 
-    let config = FanConfig::from_iter(std::env::args().skip(1));
+    let config = FanCurve::from_iter(std::env::args().skip(1));
 
     let mut idrac = Idrac::new();
 
     loop {
+        // The program loop.
+        // 1) Retrieve the system temperature.
+        // 2) Configure the system's fan speed as desired.
+        // 3) Wait
+        // 4) Repeat
         match get_max_temperature() {
             Ok(temperature) => {
                 let fan_speed = config.fan_speed(Temperature(temperature));
@@ -137,6 +143,11 @@ fn main() {
     }
 }
 
+/// An object used to keep track of iDRAC's current fan speed, if any.
+///
+/// It also guarantees we at least try to re-active iDRAC's own fan-controller if the program
+/// stops. It does this by implementing the `Drop` trait, which is called when the object goes out
+/// of scope: if we either panic or exit.
 struct Idrac {
     /// The current fan speed, if enabled.
     /// `None` if manual fan control is disabled.
@@ -184,6 +195,9 @@ impl Drop for Idrac {
 }
 
 fn raw_ipmitool(arguments: impl Into<String>) -> Result<(), String> {
+    // TODO: Let us configure our own login interface/arguments.
+    //  Right now, we hard-code the 'open' interface. In the future, we might want
+    //  to be able to control a remote iDRAC server.
     let output = Command::new("ipmitool")
         .arg("-I")
         .arg("open")
@@ -249,13 +263,13 @@ mod tests {
 
     #[test]
     fn test_fan_config_from_empty_iter() {
-        let config = FanConfig::from_iter(Vec::<String>::new());
+        let config = FanCurve::from_iter(Vec::<String>::new());
         assert_eq!(Vec::<(Temperature, FanSpeed)>::new(), config.config)
     }
 
     #[test]
     fn test_fan_config_from_iter() {
-        let config = FanConfig::from_iter(["50:10".to_owned(), "60:20".to_owned()]);
+        let config = FanCurve::from_iter(["50:10".to_owned(), "60:20".to_owned()]);
         assert_eq!(vec![
             (Temperature(50), FanSpeed::new(10)),
             (Temperature(60), FanSpeed::new(20))
@@ -264,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_fan_config_from_unsorted_iter() {
-        let config = FanConfig::from_iter(["60:20".to_owned(), "50:10".to_owned()]);
+        let config = FanCurve::from_iter(["60:20".to_owned(), "50:10".to_owned()]);
         assert_eq!(vec![
             (Temperature(50), FanSpeed::new(10)),
             (Temperature(60), FanSpeed::new(20))
@@ -273,14 +287,14 @@ mod tests {
 
     #[test]
     fn test_empty_fan_config() {
-        let config = FanConfig::new(&[]);
+        let config = FanCurve::new(&[]);
         assert_eq!(config.fan_speed(Temperature(0)), None);
         assert_eq!(config.fan_speed(Temperature(100)), None);
     }
 
     #[test]
     fn test_simple_fan_config() {
-        let config = FanConfig::new(&[(Temperature(50), FanSpeed::new(10))]);
+        let config = FanCurve::new(&[(Temperature(50), FanSpeed::new(10))]);
         assert_eq!(config.fan_speed(Temperature(45)), Some(FanSpeed::new(10)));
         assert_eq!(config.fan_speed(Temperature(50)), None);
         assert_eq!(config.fan_speed(Temperature(55)), None);
@@ -288,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_fan_config() {
-        let config = FanConfig::new(&[
+        let config = FanCurve::new(&[
             (Temperature(50), FanSpeed::new(10)),
             (Temperature(60), FanSpeed::new(20)),
         ]);
@@ -301,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_unsorted_fan_config() {
-        let config = FanConfig::new(&[
+        let config = FanCurve::new(&[
             (Temperature(60), FanSpeed::new(20)),
             (Temperature(50), FanSpeed::new(10)),
         ]);
