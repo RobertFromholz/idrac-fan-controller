@@ -7,6 +7,7 @@ Type=simple
 ExecStart=/usr/local/bin/idrac-fan-controller "50:10" "60:20"
 
 Environment="DELAY=10"
+Environment="RAMP_DOWN_THRESHOLD=3"
 
 Restart=always
 RestartSec=10
