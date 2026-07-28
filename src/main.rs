@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Formatter;
 use std::process::Command;
 use std::time::Duration;
 use std::{fmt, thread};
 
+const ROLLING_AVERAGE_WINDOW: usize = 5;
 const DEFAULT_DELAY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
@@ -106,6 +107,8 @@ fn main() {
 
     let mut idrac = Idrac::new();
 
+    let mut rolling_window = VecDeque::with_capacity(ROLLING_AVERAGE_WINDOW);
+
     loop {
         // The program loop.
         // 1) Retrieve the system temperature.
@@ -113,7 +116,15 @@ fn main() {
         // 3) Wait
         // 4) Repeat
         match get_max_temperature() {
-            Ok(temperature) => {
+            Ok(last_temperature) => {
+                // Keep a rolling average of the last N temperatures.
+                if rolling_window.len() == ROLLING_AVERAGE_WINDOW {
+                    rolling_window.pop_front();
+                }
+                rolling_window.push_back(last_temperature);
+                // Calculate the rolling average.
+                let temperature = rolling_window.iter().sum::<u32>() / (rolling_window.len() as u32);
+
                 let fan_speed = config.fan_speed(Temperature(temperature));
                 match fan_speed {
                     None => {
