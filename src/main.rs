@@ -6,6 +6,7 @@ use std::{fmt, thread};
 
 const ROLLING_AVERAGE_WINDOW: usize = 5;
 const DEFAULT_DELAY: Duration = Duration::from_secs(10);
+const DEFAULT_RAMP_DOWN_THRESHOLD: usize = 3;
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 struct Temperature(u32);
@@ -93,6 +94,33 @@ impl FanCurve {
         }
         None
     }
+
+    /// The configured fan speed for the current temperature, given a hysteresis factor.
+    ///
+    /// To decrease the fan speed, the temperature must be at least `hysteresis_offset` within the
+    /// range for that fan speed. For example, to drop to `50:10` from `60:20`, the temperature
+    /// must be at or below `47`, given an offset of `3` (the default).
+    pub fn gradual_fan_speed(&self,
+                             temperature: Temperature,
+                             fan_speed: Option<FanSpeed>,
+                             hysteresis_offset: usize) -> Option<FanSpeed> {
+        let target = self.fan_speed(temperature);
+
+        // Check if we want to decrease the fan speed.
+        match (target, fan_speed) {
+            (Some(target), Some(current)) if target < current => {},
+            _ => return target,
+        };
+
+        for &(max_temp, fan_speed) in &self.config {
+            let offset_temp = Temperature(max_temp.0.saturating_sub(hysteresis_offset as u32));
+            if temperature < offset_temp {
+                return Some(fan_speed);
+            }
+        }
+
+        fan_speed
+    }
 }
 
 fn main() {
@@ -102,6 +130,11 @@ fn main() {
         .map(|value| value.parse::<u64>().expect("couldn't parse DELAY"))
         .map(|delay| Duration::from_secs(delay))
         .unwrap_or(DEFAULT_DELAY);
+
+    let ramp_down_threshold = std::env::var("RAMP_DOWN_THRESHOLD")
+        .ok()
+        .map(|value | value.parse::<usize>().expect("couldn't parse RAMP_DOWN_THRESHOLD"))
+        .unwrap_or(DEFAULT_RAMP_DOWN_THRESHOLD);
 
     let config = FanCurve::from_iter(std::env::args().skip(1));
 
@@ -125,7 +158,11 @@ fn main() {
                 // Calculate the rolling average.
                 let temperature = rolling_window.iter().sum::<u32>() / (rolling_window.len() as u32);
 
-                let fan_speed = config.fan_speed(Temperature(temperature));
+                let fan_speed = config.gradual_fan_speed(
+                    Temperature(temperature),
+                    idrac.fan_speed,
+                    ramp_down_threshold,
+                );
                 match fan_speed {
                     None => {
                         if idrac.fan_speed != None {
@@ -213,7 +250,7 @@ fn raw_ipmitool(arguments: impl Into<String>) -> Result<(), String> {
         .arg("-I")
         .arg("open")
         .arg("raw")
-        .args(arguments.into().split(" "))
+        .args(arguments.into().split_whitespace())
         .output()
         .map_err(|msg| format!("couldn't invoke ipmitool: {msg}"))?;
     if output.status.success() {
@@ -335,5 +372,46 @@ mod tests {
         assert_eq!(config.fan_speed(Temperature(55)), Some(FanSpeed::new(20)));
         assert_eq!(config.fan_speed(Temperature(60)), None);
         assert_eq!(config.fan_speed(Temperature(65)), None);
+    }
+
+    #[test]
+    fn test_hysteresis_ramp_up_instant() {
+        let config = FanCurve::new(&[
+            (Temperature(50), FanSpeed::new(10)),
+            (Temperature(60), FanSpeed::new(20)),
+        ]);
+
+        // The fan speed should increase immediately.
+        let target = config.gradual_fan_speed(
+            Temperature(50),
+            Some(FanSpeed::new(10)),
+            3,
+        );
+        assert_eq!(target, Some(FanSpeed::new(20)));
+    }
+
+    #[test]
+    fn test_hysteresis_ramp_down_delayed() {
+        let config = FanCurve::new(&[
+            (Temperature(50), FanSpeed::new(10)),
+            (Temperature(60), FanSpeed::new(20)),
+        ]);
+
+        // The fan speed should not decrease, since the new temperature is not 3 below the
+        // specified temperature (50 - 3 = 47).
+        let target = config.gradual_fan_speed(
+            Temperature(48),
+            Some(FanSpeed::new(20)),
+            3,
+        );
+        assert_eq!(target, Some(FanSpeed::new(20)));
+
+        // The temperature drops to 46 (4 below), the fan speed should now decrease.
+        let target_cooled = config.gradual_fan_speed(
+            Temperature(46),
+            Some(FanSpeed::new(20)),
+            3,
+        );
+        assert_eq!(target_cooled, Some(FanSpeed::new(10)));
     }
 }

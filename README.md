@@ -50,7 +50,7 @@ sudo systemctl start idrac-fan-controller.service
 
 ## Configuration
 
-The program accepts a 'fan-curve' as arguments. If the program isn't given any arguments it does nothing: it always re-activates iDRAC's fan controller.
+The program accepts a 'fan-curve' as an argument. If the program isn't given any arguments it does nothing: it always re-activates iDRAC's fan controller.
 
 A 'fan-curve' is a list of arguments of the form `<max temperature>:<fan speed>`.
 
@@ -66,10 +66,14 @@ and set the fan speed according to that entry.
 
 If an entry isn't found, that is if the temperature is higher than any entry, iDRAC's fan controller is activated.
 
+To avoid the program oscillating between two fan speeds. The fan speed will not be decreased until the temperature drops 
+3 degrees below the required temperature for a given fan speed. The exact temperature offset required can be configured 
+by the `RAMP_DOWN_THRESHOLD` environment variable (by default: 3). 
+
 The program polls iDRAC at regular intervals for the system's current temperature. The program will use the sensor with the highest measured
 temperature to determine the appropriate fan speed.
 
-The interval can be configured in seconds by setting the `DELAY` environment variable (by default: 10s).
+The interval can be configured in seconds by setting the `DELAY` environment variable (by default: 10).
 
 ## Supported iDRAC versions
 
