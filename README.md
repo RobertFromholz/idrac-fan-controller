@@ -126,3 +126,4 @@ If the environment variable `METRICS_ADDRESS` is set, this program will expose m
 
 * `idrac_fan_controller_speed`: Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.
 * `idrac_fan_controller_status`: Is manual fan speed enabled (1 = yes, 0 = no).
+* `idrac_temperature{name="..."}`: Temperature sensor reading in degrees Celsius.

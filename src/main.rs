@@ -149,8 +149,10 @@ fn main() {
 
     let mut idrac = Idrac::new();
 
+    let temperatures = Arc::new(Mutex::new(HashMap::new()));
+
     if let Some(metrics_address) = std::env::var("METRICS_ADDRESS").ok() {
-        start_exporter(&idrac, metrics_address);
+        start_exporter(idrac.fan_speed(), temperatures.clone(), metrics_address);
     }
 
     let mut rolling_window = VecDeque::with_capacity(ROLLING_AVERAGE_WINDOW);
@@ -161,7 +163,7 @@ fn main() {
         // 2) Configure the system's fan speed as desired.
         // 3) Wait
         // 4) Repeat
-        match get_max_temperature() {
+        match get_max_temperature(temperatures.clone()) {
             Ok(last_temperature) => {
                 // Keep a rolling average of the last N temperatures.
                 if rolling_window.len() == ROLLING_AVERAGE_WINDOW {
@@ -169,9 +171,8 @@ fn main() {
                 }
                 rolling_window.push_back(last_temperature);
                 // Calculate the rolling average.
-                let temperature = {
-                    rolling_window.iter().sum::<u32>() / (rolling_window.len() as u32)
-                };
+                let temperature =
+                    { rolling_window.iter().sum::<u32>() / (rolling_window.len() as u32) };
 
                 let current_fan_speed = idrac.fan_speed().lock().unwrap().clone();
 
@@ -281,9 +282,11 @@ fn raw_ipmitool(arguments: impl Into<String>) -> Result<(), String> {
     }
 }
 
-fn start_exporter(idrac: &Idrac, metrics_address: String) {
-    let fan_speed = idrac.fan_speed();
-
+fn start_exporter(
+    fan_speed: Arc<Mutex<Option<FanSpeed>>>,
+    temperatures: Arc<Mutex<HashMap<String, u32>>>,
+    metrics_address: String,
+) {
     let listener = TcpListener::bind(&metrics_address).expect("couldn't start exporter");
 
     thread::spawn(move || {
@@ -291,14 +294,18 @@ fn start_exporter(idrac: &Idrac, metrics_address: String) {
 
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => handle_exporter_request(stream, &fan_speed),
+                Ok(stream) => handle_exporter_request(stream, &fan_speed, &temperatures),
                 Err(e) => eprintln!("error accepting connection: {e}"),
             }
         }
     });
 }
 
-fn handle_exporter_request(stream: TcpStream, fan_speed: &Arc<Mutex<Option<FanSpeed>>>) {
+fn handle_exporter_request(
+    stream: TcpStream,
+    fan_speed: &Arc<Mutex<Option<FanSpeed>>>,
+    temperatures: &Arc<Mutex<HashMap<String, u32>>>,
+) {
     let path = match read_http_request(&stream) {
         Ok(path) => path,
         Err(e) => {
@@ -310,7 +317,8 @@ fn handle_exporter_request(stream: TcpStream, fan_speed: &Arc<Mutex<Option<FanSp
     match path.as_deref() {
         Some("/metrics") => {
             let fan_speed = *fan_speed.lock().unwrap();
-            let body = render_metrics(fan_speed);
+            let temperatures = temperatures.lock().unwrap();
+            let body = render_metrics(fan_speed, &temperatures);
             write_http_response(stream, "200 OK", "text/plain; version=0.0.4", &body);
         }
         _ => write_http_response(stream, "404 Not Found", "text/plain", "Not Found\n"),
@@ -323,9 +331,7 @@ fn read_http_request(stream: &TcpStream) -> std::io::Result<Option<String>> {
     let Some(request) = request else {
         return Ok(None);
     };
-    let path = request.split_whitespace()
-        .nth(1)
-        .map(str::to_owned);
+    let path = request.split_whitespace().nth(1).map(str::to_owned);
     Ok(path)
 }
 
@@ -344,9 +350,9 @@ fn write_http_response(mut stream: TcpStream, status: &str, content_type: &str, 
     }
 }
 
-fn render_metrics(fan_speed: Option<FanSpeed>) -> String {
+fn render_metrics(fan_speed: Option<FanSpeed>, temperatures: &HashMap<String, u32>) -> String {
     let speed = fan_speed
-        // We can convert a u8 to an i8 since the value will only be between 0 and 100.
+        // We can convert an u8 to an i8 since the value will only be between 0 and 100.
         .map(|fan_speed| fan_speed.0 as i8)
         .unwrap_or(-1);
 
@@ -355,20 +361,37 @@ fn render_metrics(fan_speed: Option<FanSpeed>) -> String {
         Some(_) => 1,
     };
 
-    format!(
+    let mut output = format!(
         "# HELP idrac_fan_controller_speed Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.\n\
          # TYPE idrac_fan_controller_speed gauge\n\
          idrac_fan_controller_speed {speed}\n\
          # HELP idrac_fan_controller_status Is manual fan speed enabled (1 = yes, 0 = no).\n\
          # TYPE idrac_fan_controller_status gauge\n\
-         idrac_fan_controller_status {status}\n"
-    )
+         idrac_fan_controller_status {status}\n\
+         # HELP idrac_temperature Temperature sensor reading in degrees Celsius.\n\
+         # TYPE idrac_temperature gauge\n"
+    );
+
+    let mut temperatures = temperatures.iter().collect::<Vec<_>>();
+    temperatures.sort_by_key(|(name, _)| *name);
+
+    for (name, temperature) in temperatures {
+        let name = name
+            .replace('\\', r"\\")
+            .replace('\n', r"\n")
+            .replace('"', r#"\""#);
+        output += &format!("idrac_temperature{{name=\"{name}\"}} {temperature}\n");
+    }
+
+    output
 }
 
-fn get_max_temperature() -> Result<u32, String> {
-    let temperatures = get_temperatures()?;
+fn get_max_temperature(temperatures: Arc<Mutex<HashMap<String, u32>>>) -> Result<u32, String> {
+    let mut temperatures = temperatures.lock().unwrap();
+    *temperatures = get_temperatures()?;
     temperatures
-        .into_values()
+        .values()
+        .copied()
         .max()
         .ok_or_else(|| "couldn't find temperature".to_owned())
 }
@@ -516,26 +539,70 @@ mod tests {
     #[test]
     fn test_render_metrics_when_manual_fan_control_is_disabled() {
         assert_eq!(
-            render_metrics(None),
+            render_metrics(None, &HashMap::new()),
             "# HELP idrac_fan_controller_speed Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.\n\
              # TYPE idrac_fan_controller_speed gauge\n\
              idrac_fan_controller_speed -1\n\
              # HELP idrac_fan_controller_status Is manual fan speed enabled (1 = yes, 0 = no).\n\
              # TYPE idrac_fan_controller_status gauge\n\
-             idrac_fan_controller_status 0\n"
+             idrac_fan_controller_status 0\n\
+             # HELP idrac_temperature Temperature sensor reading in degrees Celsius.\n\
+             # TYPE idrac_temperature gauge\n"
         );
     }
 
     #[test]
     fn test_render_metrics_when_manual_fan_control_is_enabled() {
         assert_eq!(
-            render_metrics(Some(FanSpeed::new(20))),
+            render_metrics(Some(FanSpeed::new(20)), &HashMap::new()),
             "# HELP idrac_fan_controller_speed Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.\n\
              # TYPE idrac_fan_controller_speed gauge\n\
              idrac_fan_controller_speed 20\n\
              # HELP idrac_fan_controller_status Is manual fan speed enabled (1 = yes, 0 = no).\n\
              # TYPE idrac_fan_controller_status gauge\n\
-             idrac_fan_controller_status 1\n"
+             idrac_fan_controller_status 1\n\
+             # HELP idrac_temperature Temperature sensor reading in degrees Celsius.\n\
+             # TYPE idrac_temperature gauge\n"
+        );
+    }
+
+    #[test]
+    fn test_render_metrics_includes_temperatures() {
+        let temperatures = HashMap::from([
+            ("Exhaust Temp".to_owned(), 40),
+            ("Ambient Temp".to_owned(), 21),
+        ]);
+
+        assert_eq!(
+            render_metrics(Some(FanSpeed::new(20)), &temperatures),
+            "# HELP idrac_fan_controller_speed Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.\n\
+             # TYPE idrac_fan_controller_speed gauge\n\
+             idrac_fan_controller_speed 20\n\
+             # HELP idrac_fan_controller_status Is manual fan speed enabled (1 = yes, 0 = no).\n\
+             # TYPE idrac_fan_controller_status gauge\n\
+             idrac_fan_controller_status 1\n\
+             # HELP idrac_temperature Temperature sensor reading in degrees Celsius.\n\
+             # TYPE idrac_temperature gauge\n\
+             idrac_temperature{name=\"Ambient Temp\"} 21\n\
+             idrac_temperature{name=\"Exhaust Temp\"} 40\n"
+        );
+    }
+
+    #[test]
+    fn test_render_metrics_escapes_temperature_names() {
+        let temperatures = HashMap::from([("Sensor \"A\" \\ B".to_owned(), 40)]);
+
+        assert_eq!(
+            render_metrics(None, &temperatures),
+            "# HELP idrac_fan_controller_speed Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.\n\
+             # TYPE idrac_fan_controller_speed gauge\n\
+             idrac_fan_controller_speed -1\n\
+             # HELP idrac_fan_controller_status Is manual fan speed enabled (1 = yes, 0 = no).\n\
+             # TYPE idrac_fan_controller_status gauge\n\
+             idrac_fan_controller_status 0\n\
+             # HELP idrac_temperature Temperature sensor reading in degrees Celsius.\n\
+             # TYPE idrac_temperature gauge\n\
+             idrac_temperature{name=\"Sensor \\\"A\\\" \\\\ B\"} 40\n"
         );
     }
 }
