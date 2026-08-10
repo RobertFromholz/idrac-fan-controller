@@ -144,12 +144,12 @@ fn main() {
                 .expect("couldn't parse RAMP_DOWN_THRESHOLD")
         })
         .unwrap_or(DEFAULT_RAMP_DOWN_THRESHOLD);
-    
+
     let config = FanCurve::from_iter(std::env::args().skip(1));
 
     let mut idrac = Idrac::new();
 
-    if let Some(metrics_address) = std::env::var("`METRICS_ADDRESS`").ok() {
+    if let Some(metrics_address) = std::env::var("METRICS_ADDRESS").ok() {
         start_exporter(&idrac, metrics_address);
     }
 
