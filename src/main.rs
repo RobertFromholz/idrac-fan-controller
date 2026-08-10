@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Formatter;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -169,7 +169,9 @@ fn main() {
                 }
                 rolling_window.push_back(last_temperature);
                 // Calculate the rolling average.
-                let temperature = rolling_window.iter().sum::<u32>() / (rolling_window.len() as u32);
+                let temperature = {
+                    rolling_window.iter().sum::<u32>() / (rolling_window.len() as u32)
+                };
 
                 let current_fan_speed = idrac.fan_speed().lock().unwrap().clone();
 
@@ -296,23 +298,16 @@ fn start_exporter(idrac: &Idrac, metrics_address: String) {
     });
 }
 
-fn handle_exporter_request(mut stream: TcpStream, fan_speed: &Arc<Mutex<Option<FanSpeed>>>) {
-    let mut buffer = String::new();
-
-    match stream.read_to_string(&mut buffer) {
-        Ok(_) => (),
+fn handle_exporter_request(stream: TcpStream, fan_speed: &Arc<Mutex<Option<FanSpeed>>>) {
+    let path = match read_http_request(&stream) {
+        Ok(path) => path,
         Err(e) => {
             eprintln!("error processing request: {e}");
             return;
         }
     };
 
-    let path = buffer
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1));
-
-    match path {
+    match path.as_deref() {
         Some("/metrics") => {
             let fan_speed = *fan_speed.lock().unwrap();
             let body = render_metrics(fan_speed);
@@ -320,6 +315,18 @@ fn handle_exporter_request(mut stream: TcpStream, fan_speed: &Arc<Mutex<Option<F
         }
         _ => write_http_response(stream, "404 Not Found", "text/plain", "Not Found\n"),
     }
+}
+
+fn read_http_request(stream: &TcpStream) -> std::io::Result<Option<String>> {
+    let reader = BufReader::new(stream);
+    let request = reader.lines().next().transpose()?;
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let path = request.split_whitespace()
+        .nth(1)
+        .map(str::to_owned);
+    Ok(path)
 }
 
 fn write_http_response(mut stream: TcpStream, status: &str, content_type: &str, body: &str) {
@@ -345,7 +352,7 @@ fn render_metrics(fan_speed: Option<FanSpeed>) -> String {
 
     let status: u8 = match fan_speed {
         None => 0,
-        Some(_) => 1
+        Some(_) => 1,
     };
 
     format!(
