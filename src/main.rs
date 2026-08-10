@@ -389,19 +389,19 @@ fn render_metrics(
          # TYPE idrac_fan_speed gauge\n\
          {}\
          ",
-        render_sensor_data(temperatures),
-        render_sensor_data(fan_speeds),
+        render_sensor_data("idrac_temperature", temperatures),
+        render_sensor_data("idrac_fan_speed", fan_speeds),
     )
 }
 
-fn render_sensor_data(data: &HashMap<(String, String), u32>) -> String {
+fn render_sensor_data(metric: &str, data: &HashMap<(String, String), u32>) -> String {
     let mut output = String::new();
     let mut temperatures = data.iter().collect::<Vec<_>>();
     temperatures.sort_by_key(|(name, _)| *name);
 
     for ((name, id), temperature) in temperatures {
         let (name, id) = (clean_name(name), clean_name(id));
-        output += &format!("idrac_temperature{{name=\"{name}\", id=\"{id}\"}} {temperature}\n");
+        output += &format!("{metric}{{name=\"{name}\", id=\"{id}\"}} {temperature}\n");
     }
     output
 }
