@@ -1,6 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Formatter;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fmt, thread};
 
@@ -53,7 +56,7 @@ impl FanCurve {
         FanCurve { config }
     }
 
-    pub fn from_iter(iter: impl IntoIterator<Item = String>) -> FanCurve {
+    pub fn from_iter(iter: impl IntoIterator<Item=String>) -> FanCurve {
         let config = iter
             .into_iter()
             .map(|value| {
@@ -100,15 +103,17 @@ impl FanCurve {
     /// To decrease the fan speed, the temperature must be at least `hysteresis_offset` within the
     /// range for that fan speed. For example, to drop to `50:10` from `60:20`, the temperature
     /// must be at or below `47`, given an offset of `3` (the default).
-    pub fn gradual_fan_speed(&self,
-                             temperature: Temperature,
-                             fan_speed: Option<FanSpeed>,
-                             hysteresis_offset: usize) -> Option<FanSpeed> {
+    pub fn gradual_fan_speed(
+        &self,
+        temperature: Temperature,
+        fan_speed: Option<FanSpeed>,
+        hysteresis_offset: usize,
+    ) -> Option<FanSpeed> {
         let target = self.fan_speed(temperature);
 
         // Check if we want to decrease the fan speed.
         match (target, fan_speed) {
-            (Some(target), Some(current)) if target < current => {},
+            (Some(target), Some(current)) if target < current => {}
             _ => return target,
         };
 
@@ -133,12 +138,20 @@ fn main() {
 
     let ramp_down_threshold = std::env::var("RAMP_DOWN_THRESHOLD")
         .ok()
-        .map(|value | value.parse::<usize>().expect("couldn't parse RAMP_DOWN_THRESHOLD"))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("couldn't parse RAMP_DOWN_THRESHOLD")
+        })
         .unwrap_or(DEFAULT_RAMP_DOWN_THRESHOLD);
-
+    
     let config = FanCurve::from_iter(std::env::args().skip(1));
 
     let mut idrac = Idrac::new();
+
+    if let Some(metrics_address) = std::env::var("`METRICS_ADDRESS`").ok() {
+        start_exporter(&idrac, metrics_address);
+    }
 
     let mut rolling_window = VecDeque::with_capacity(ROLLING_AVERAGE_WINDOW);
 
@@ -158,32 +171,28 @@ fn main() {
                 // Calculate the rolling average.
                 let temperature = rolling_window.iter().sum::<u32>() / (rolling_window.len() as u32);
 
+                let current_fan_speed = idrac.fan_speed().lock().unwrap().clone();
+
                 let fan_speed = config.gradual_fan_speed(
                     Temperature(temperature),
-                    idrac.fan_speed,
+                    current_fan_speed,
                     ramp_down_threshold,
                 );
                 match fan_speed {
                     None => {
-                        if idrac.fan_speed != None {
-                            println!("Temperature: {}", temperature);
-                        }
                         if let Err(msg) = idrac.disable_manual_fan_control() {
-                            eprintln!("Error: {}", msg);
+                            eprintln!("{}", msg);
                         }
                     }
                     Some(fan_speed) => {
-                        if Some(fan_speed) != idrac.fan_speed {
-                            println!("Temperature: {}", temperature);
-                        }
                         if let Err(msg) = idrac.set_manual_fan_speed(fan_speed) {
-                            eprintln!("Error: {}", msg);
+                            eprintln!("{}", msg);
                         }
                     }
                 }
             }
             Err(msg) => {
-                eprintln!("Error: {}", msg);
+                eprintln!("{}", msg);
                 let _ = idrac.disable_manual_fan_control();
             }
         }
@@ -199,12 +208,18 @@ fn main() {
 struct Idrac {
     /// The current fan speed, if enabled.
     /// `None` if manual fan control is disabled.
-    fan_speed: Option<FanSpeed>,
+    fan_speed: Arc<Mutex<Option<FanSpeed>>>,
 }
 
 impl Idrac {
     pub fn new() -> Idrac {
-        Idrac { fan_speed: None }
+        Idrac {
+            fan_speed: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn fan_speed(&self) -> Arc<Mutex<Option<FanSpeed>>> {
+        self.fan_speed.clone()
     }
 
     fn enable_manual_fan_control() -> Result<(), String> {
@@ -217,21 +232,24 @@ impl Idrac {
         println!("Disabling manual fan control");
         raw_ipmitool("0x30 0x30 0x01 0x01")
             .map_err(|msg| format!("couldn't disable manual fan control: {msg}"))?;
-        self.fan_speed = None;
+        let mut fan_speed = self.fan_speed.lock().unwrap();
+        *fan_speed = None;
         Ok(())
     }
 
     pub fn set_manual_fan_speed(&mut self, percentage: FanSpeed) -> Result<(), String> {
-        if self.fan_speed == Some(percentage) {
+        let fan_speed = self.fan_speed.lock().unwrap().clone();
+        if fan_speed == Some(percentage) {
             return Ok(());
         }
-        if self.fan_speed.is_none() {
+        if fan_speed.is_none() {
             Idrac::enable_manual_fan_control()?;
         }
         println!("Setting manual fan speed to {}", percentage);
         raw_ipmitool(format!("0x30 0x30 0x02 0xff {:#04x}", percentage))
             .map_err(|msg| format!("couldn't set manual fan speed: {msg}"))?;
-        self.fan_speed = Some(percentage);
+        let mut fan_speed = self.fan_speed.lock().unwrap();
+        *fan_speed = Some(percentage);
         Ok(())
     }
 }
@@ -259,6 +277,85 @@ fn raw_ipmitool(arguments: impl Into<String>) -> Result<(), String> {
         let message = String::from_utf8_lossy(&output.stderr);
         Err(message.into())
     }
+}
+
+fn start_exporter(idrac: &Idrac, metrics_address: String) {
+    let fan_speed = idrac.fan_speed();
+
+    let listener = TcpListener::bind(&metrics_address).expect("couldn't start exporter");
+
+    thread::spawn(move || {
+        println!("Listening at: http://{metrics_address}/metrics");
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_exporter_request(stream, &fan_speed),
+                Err(e) => eprintln!("error accepting connection: {e}"),
+            }
+        }
+    });
+}
+
+fn handle_exporter_request(mut stream: TcpStream, fan_speed: &Arc<Mutex<Option<FanSpeed>>>) {
+    let mut buffer = String::new();
+
+    match stream.read_to_string(&mut buffer) {
+        Ok(_) => (),
+        Err(e) => {
+            eprintln!("error processing request: {e}");
+            return;
+        }
+    };
+
+    let path = buffer
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1));
+
+    match path {
+        Some("/metrics") => {
+            let fan_speed = *fan_speed.lock().unwrap();
+            let body = render_metrics(fan_speed);
+            write_http_response(stream, "200 OK", "text/plain; version=0.0.4", &body);
+        }
+        _ => write_http_response(stream, "404 Not Found", "text/plain", "Not Found\n"),
+    }
+}
+
+fn write_http_response(mut stream: TcpStream, status: &str, content_type: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\n\
+        Content-Type: {content_type}\r\n\
+        Content-Length: {}\r\n\
+        Connection: close\r\n\
+        \r\n\
+        {body}",
+        body.len()
+    );
+    if let Err(e) = stream.write_all(response.as_bytes()) {
+        eprintln!("error writing response: {e}");
+    }
+}
+
+fn render_metrics(fan_speed: Option<FanSpeed>) -> String {
+    let speed = fan_speed
+        // We can convert a u8 to an i8 since the value will only be between 0 and 100.
+        .map(|fan_speed| fan_speed.0 as i8)
+        .unwrap_or(-1);
+
+    let status: u8 = match fan_speed {
+        None => 0,
+        Some(_) => 1
+    };
+
+    format!(
+        "# HELP idrac_fan_controller_speed Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.\n\
+         # TYPE idrac_fan_controller_speed gauge\n\
+         idrac_fan_controller_speed {speed}\n\
+         # HELP idrac_fan_controller_status Is manual fan speed enabled (1 = yes, 0 = no).\n\
+         # TYPE idrac_fan_controller_status gauge\n\
+         idrac_fan_controller_status {status}\n"
+    )
 }
 
 fn get_max_temperature() -> Result<u32, String> {
@@ -318,19 +415,25 @@ mod tests {
     #[test]
     fn test_fan_config_from_iter() {
         let config = FanCurve::from_iter(["50:10".to_owned(), "60:20".to_owned()]);
-        assert_eq!(vec![
-            (Temperature(50), FanSpeed::new(10)),
-            (Temperature(60), FanSpeed::new(20))
-        ], config.config)
+        assert_eq!(
+            vec![
+                (Temperature(50), FanSpeed::new(10)),
+                (Temperature(60), FanSpeed::new(20))
+            ],
+            config.config
+        )
     }
 
     #[test]
     fn test_fan_config_from_unsorted_iter() {
         let config = FanCurve::from_iter(["60:20".to_owned(), "50:10".to_owned()]);
-        assert_eq!(vec![
-            (Temperature(50), FanSpeed::new(10)),
-            (Temperature(60), FanSpeed::new(20))
-        ], config.config)
+        assert_eq!(
+            vec![
+                (Temperature(50), FanSpeed::new(10)),
+                (Temperature(60), FanSpeed::new(20))
+            ],
+            config.config
+        )
     }
 
     #[test]
@@ -382,11 +485,7 @@ mod tests {
         ]);
 
         // The fan speed should increase immediately.
-        let target = config.gradual_fan_speed(
-            Temperature(50),
-            Some(FanSpeed::new(10)),
-            3,
-        );
+        let target = config.gradual_fan_speed(Temperature(50), Some(FanSpeed::new(10)), 3);
         assert_eq!(target, Some(FanSpeed::new(20)));
     }
 
@@ -399,19 +498,37 @@ mod tests {
 
         // The fan speed should not decrease, since the new temperature is not 3 below the
         // specified temperature (50 - 3 = 47).
-        let target = config.gradual_fan_speed(
-            Temperature(48),
-            Some(FanSpeed::new(20)),
-            3,
-        );
+        let target = config.gradual_fan_speed(Temperature(48), Some(FanSpeed::new(20)), 3);
         assert_eq!(target, Some(FanSpeed::new(20)));
 
         // The temperature drops to 46 (4 below), the fan speed should now decrease.
-        let target_cooled = config.gradual_fan_speed(
-            Temperature(46),
-            Some(FanSpeed::new(20)),
-            3,
-        );
+        let target_cooled = config.gradual_fan_speed(Temperature(46), Some(FanSpeed::new(20)), 3);
         assert_eq!(target_cooled, Some(FanSpeed::new(10)));
+    }
+
+    #[test]
+    fn test_render_metrics_when_manual_fan_control_is_disabled() {
+        assert_eq!(
+            render_metrics(None),
+            "# HELP idrac_fan_controller_speed Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.\n\
+             # TYPE idrac_fan_controller_speed gauge\n\
+             idrac_fan_controller_speed -1\n\
+             # HELP idrac_fan_controller_status Is manual fan speed enabled (1 = yes, 0 = no).\n\
+             # TYPE idrac_fan_controller_status gauge\n\
+             idrac_fan_controller_status 0\n"
+        );
+    }
+
+    #[test]
+    fn test_render_metrics_when_manual_fan_control_is_enabled() {
+        assert_eq!(
+            render_metrics(Some(FanSpeed::new(20))),
+            "# HELP idrac_fan_controller_speed Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.\n\
+             # TYPE idrac_fan_controller_speed gauge\n\
+             idrac_fan_controller_speed 20\n\
+             # HELP idrac_fan_controller_status Is manual fan speed enabled (1 = yes, 0 = no).\n\
+             # TYPE idrac_fan_controller_status gauge\n\
+             idrac_fan_controller_status 1\n"
+        );
     }
 }

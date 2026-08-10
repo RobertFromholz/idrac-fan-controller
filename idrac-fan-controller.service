@@ -8,6 +8,7 @@ ExecStart=/usr/local/bin/idrac-fan-controller "50:10" "60:20"
 
 Environment="DELAY=10"
 Environment="RAMP_DOWN_THRESHOLD=3"
+Environment="METRICS_ADDRESS=127.0.0.1:5050"
 
 Restart=always
 RestartSec=10

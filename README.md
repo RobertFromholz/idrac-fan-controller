@@ -119,3 +119,10 @@ GPU7 Temp        | FCh | ns  |  7.1 | Disabled
 GPU8 Temp        | FDh | ns  |  7.1 | Disabled
 Exhaust Temp     | 06h | ok  |  7.1 | 40 degrees C
 ```
+
+## Metrics
+
+If the environment variable `METRICS_ADDRESS` is set, this program will expose metrics at the configured interface.
+
+* `idrac_fan_controller_speed`: Fan speed as a percent from 0 or 100, or -1 if manual fan speed is disabled.
+* `idrac_fan_controller_status`: Is manual fan speed enabled (1 = yes, 0 = no).
