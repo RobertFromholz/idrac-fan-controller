@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use std::{fmt, thread};
 use std::iter::Sum;
 
-const ROLLING_AVERAGE_WINDOW: usize = 5;
 const DEFAULT_DELAY: Duration = Duration::from_secs(10);
 const DEFAULT_RAMP_DOWN_THRESHOLD: usize = 3;
 const DEFAULT_RAMP_UP_DELAY: Duration = Duration::from_secs(10);
 const DEFAULT_CRITICAL_TEMPERATURE: Temperature = Temperature(90);
+const DEFAULT_ROLLING_AVERAGE_WINDOW: usize = 5;
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 struct Temperature(u32);
@@ -63,7 +63,9 @@ struct FanCurve {
     ramp_up_delay: Duration,
     /// The temperature at which iDRAC's fan controller is re-activated immediately.
     critical_temperature: Temperature,
-    /// The last `ROLLING_AVERAGE_WINDOW` temperature readings.
+    /// How many temperature readings to average.
+    rolling_average_window: usize,
+    /// The last `rolling_average_window` temperature readings.
     rolling_window: VecDeque<Temperature>,
     /// When the latest temperature reading started calling for a higher fan speed, if it still does.
     elevated_since: Option<Instant>,
@@ -78,7 +80,8 @@ impl FanCurve {
             ramp_down_threshold: DEFAULT_RAMP_DOWN_THRESHOLD,
             ramp_up_delay: DEFAULT_RAMP_UP_DELAY,
             critical_temperature: DEFAULT_CRITICAL_TEMPERATURE,
-            rolling_window: VecDeque::with_capacity(ROLLING_AVERAGE_WINDOW),
+            rolling_average_window: DEFAULT_ROLLING_AVERAGE_WINDOW,
+            rolling_window: VecDeque::with_capacity(DEFAULT_ROLLING_AVERAGE_WINDOW),
             elevated_since: None,
         }
     }
@@ -114,10 +117,17 @@ impl FanCurve {
         self
     }
 
+    pub fn with_rolling_average_window(mut self, rolling_average_window: usize) -> FanCurve {
+        assert!(rolling_average_window > 0, "rolling average window must be at least 1");
+        self.rolling_average_window = rolling_average_window;
+        self.rolling_window = VecDeque::with_capacity(rolling_average_window);
+        self
+    }
+
     /// The fan speed to apply, given the latest temperature reading and the current fan speed.
     /// Returns `None` if manual fan control should be disabled.
     ///
-    /// The fan speed is determined by a rolling average of the last `ROLLING_AVERAGE_WINDOW`
+    /// The fan speed is determined by a rolling average of the last `rolling_average_window`
     /// temperature readings (see `gradual_fan_speed`).
     ///
     /// Increasing the fan speed is delayed until the latest temperature reading has called for a
@@ -135,7 +145,7 @@ impl FanCurve {
         now: Instant,
     ) -> Option<FanSpeed> {
         // Keep a rolling average of the last N temperatures.
-        if self.rolling_window.len() == ROLLING_AVERAGE_WINDOW {
+        if self.rolling_window.len() == self.rolling_average_window {
             self.rolling_window.pop_front();
         }
         self.rolling_window.push_back(temperature);
@@ -266,10 +276,16 @@ fn main() {
         .map(|temperature| Temperature(temperature))
         .unwrap_or(DEFAULT_CRITICAL_TEMPERATURE);
 
+    let rolling_average_window = std::env::var("ROLLING_AVERAGE_WINDOW")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("couldn't parse ROLLING_AVERAGE_WINDOW"))
+        .unwrap_or(DEFAULT_ROLLING_AVERAGE_WINDOW);
+
     let mut config = FanCurve::from_iter(std::env::args().skip(1))
         .with_ramp_down_threshold(ramp_down_threshold)
         .with_ramp_up_delay(ramp_up_delay)
-        .with_critical_temperature(critical_temperature);
+        .with_critical_temperature(critical_temperature)
+        .with_rolling_average_window(rolling_average_window);
 
     let mut idrac = Idrac::new();
 
@@ -791,6 +807,30 @@ mod tests {
         let low = Some(FanSpeed::new(10));
 
         assert_eq!(config.fan_speed(Temperature(45), None, Instant::now()), low);
+    }
+
+    #[test]
+    fn test_rolling_average_window() {
+        let (low, high) = (Some(FanSpeed::new(10)), Some(FanSpeed::new(20)));
+        let now = Instant::now();
+
+        // The default window averages 40 and 55 to 47.
+        let mut config = ramp_up_curve().with_ramp_up_delay(Duration::ZERO);
+        assert_eq!(config.fan_speed(Temperature(40), low, now), low);
+        assert_eq!(config.fan_speed(Temperature(55), low, now), low);
+
+        // A window of 1 only looks at the latest reading.
+        let mut config = ramp_up_curve()
+            .with_ramp_up_delay(Duration::ZERO)
+            .with_rolling_average_window(1);
+        assert_eq!(config.fan_speed(Temperature(40), low, now), low);
+        assert_eq!(config.fan_speed(Temperature(55), low, now), high);
+    }
+
+    #[test]
+    #[should_panic(expected = "rolling average window must be at least 1")]
+    fn test_empty_rolling_average_window() {
+        ramp_up_curve().with_rolling_average_window(0);
     }
 
     #[test]

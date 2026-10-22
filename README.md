@@ -74,7 +74,11 @@ To avoid short temperature spikes (for example, from briefly loading a single co
 be increased until the temperature has called for a higher fan speed for some time. The delay can be configured in seconds by the
 `RAMP_UP_DELAY` environment variable (by default: 10). Re-activating iDRAC's fan controller is never delayed.
 
-Fan speeds are based on a rolling average of the last 5 temperature readings, so a sudden jump above the highest entry
+Fan speeds are based on a rolling average of the last few temperature readings. The number of readings can be configured by the
+`ROLLING_AVERAGE_WINDOW` environment variable (by default: 5). Together with `DELAY`, this determines how long a period is
+averaged: by default, 50 seconds. If you decrease `DELAY`, you might want to increase `ROLLING_AVERAGE_WINDOW` accordingly.
+
+Because of the rolling average, a sudden jump above the highest entry
 in the 'fan-curve' takes a reading or two to re-activate iDRAC's fan controller. As a safety net, if a single reading is at or above
 the critical temperature, iDRAC's fan controller is always re-activated immediately. The critical temperature can be configured
 in ˚C by the `CRITICAL_TEMPERATURE` environment variable (by default: 90).

@@ -10,6 +10,7 @@ Environment="DELAY=10"
 Environment="RAMP_DOWN_THRESHOLD=3"
 Environment="RAMP_UP_DELAY=10"
 Environment="CRITICAL_TEMPERATURE=90"
+Environment="ROLLING_AVERAGE_WINDOW=5"
 Environment="METRICS_ADDRESS=127.0.0.1:5050"
 
 Restart=always
