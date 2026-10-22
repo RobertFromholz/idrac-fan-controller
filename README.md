@@ -70,6 +70,15 @@ To avoid the program oscillating between two fan speeds. The fan speed will not 
 3 degrees below the required temperature for a given fan speed. The exact temperature offset required can be configured 
 by the `RAMP_DOWN_THRESHOLD` environment variable (by default: 3). 
 
+To avoid short temperature spikes (for example, from briefly loading a single core) ramping up the fans, the fan speed will not
+be increased until the temperature has called for a higher fan speed for some time. The delay can be configured in seconds by the
+`RAMP_UP_DELAY` environment variable (by default: 10). Re-activating iDRAC's fan controller is never delayed.
+
+Fan speeds are based on a rolling average of the last 5 temperature readings, so a sudden jump above the highest entry
+in the 'fan-curve' takes a reading or two to re-activate iDRAC's fan controller. As a safety net, if a single reading is at or above
+the critical temperature, iDRAC's fan controller is always re-activated immediately. The critical temperature can be configured
+in ˚C by the `CRITICAL_TEMPERATURE` environment variable (by default: 90).
+
 The program polls iDRAC at regular intervals for the system's current temperature. The program will use the sensor with the highest measured
 temperature to determine the appropriate fan speed.
 
@@ -98,7 +107,7 @@ All commands begin with `ipmitool -I open`. The interface `open` signifies that 
 `ipmitool -I open raw 0x30 0x30 0x01 0x00`: enable manual fan control. This disables iDRAC's fan controller and let's us control fan
 speeds manually.
 
-`ipmitool -I open raw 0x30 0x30 0x01 0x001`: disable manual fan control. This re-activates iDRAC's fan controller.
+`ipmitool -I open raw 0x30 0x30 0x01 0x01`: disable manual fan control. This re-activates iDRAC's fan controller.
 
 `ipmitool -I open raw 0x30 0x30 0x02 0xff 0x0A`: set manual fan speed. This is only available if we have already enabled manual fan control.
 The last argument specifies the fan speed. The fan speed is specified as a percentage encoded as a 2-digit hexadecimal value.
